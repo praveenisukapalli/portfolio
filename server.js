@@ -1,12 +1,16 @@
-const http = require("http");
-const fs = require("fs");
-const path = require("path");
+const http = require("node:http");
+const fs = require("node:fs");
+const path = require("node:path");
+const zlib = require("node:zlib");
+const { promisify } = require("node:util");
+
+const gzip = promisify(zlib.gzip);
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, "src");
-const MESSAGES_FILE = path.join(__dirname, "messages.json");
-const MAX_BODY_BYTES = 10 * 1024;
-const RATE_LIMIT = { windowMs: 15 * 60 * 1000, max: 5 };
+const NOT_FOUND_PAGE = path.join(PUBLIC_DIR, "404.html");
+const COMPRESSIBLE = new Set([".html", ".css", ".js", ".json", ".svg", ".txt"]);
+const MIN_GZIP_BYTES = 1024;
 
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
@@ -20,6 +24,7 @@ const MIME_TYPES = {
   ".webp": "image/webp",
   ".ico": "image/x-icon",
   ".pdf": "application/pdf",
+  ".txt": "text/plain; charset=utf-8",
   ".woff2": "font/woff2",
 };
 
@@ -30,7 +35,8 @@ const SECURITY_HEADERS = {
     "style-src 'self' https://fonts.googleapis.com",
     "font-src https://fonts.gstatic.com",
     "img-src 'self' data:",
-    "connect-src 'self'",
+    "connect-src 'self' https://formspree.io",
+    "object-src 'none'",
     "frame-ancestors 'none'",
     "base-uri 'self'",
     "form-action 'self'",
@@ -38,6 +44,8 @@ const SECURITY_HEADERS = {
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "strict-origin-when-cross-origin",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+  "Cross-Origin-Opener-Policy": "same-origin",
 };
 
 function send(res, status, body, type = "application/json; charset=utf-8") {
@@ -46,142 +54,93 @@ function send(res, status, body, type = "application/json; charset=utf-8") {
 }
 
 // ---------- Static files ----------
-function serveStatic(req, res) {
+// Gzipped bodies are cached per file version (ETag) so each asset is compressed once.
+const gzipCache = new Map();
+
+async function compress(filePath, etag, data) {
+  const cached = gzipCache.get(filePath);
+  if (cached && cached.etag === etag) return cached.body;
+  const body = await gzip(data);
+  gzipCache.set(filePath, { etag, body });
+  return body;
+}
+
+async function serveFile(req, res, filePath, status = 200) {
+  const stat = await fs.promises.stat(filePath);
+  if (!stat.isFile()) throw Object.assign(new Error("Not a file"), { code: "EISDIR" });
+
+  const ext = path.extname(filePath).toLowerCase();
+  const etag = `W/"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+  const headers = {
+    ...SECURITY_HEADERS,
+    "Content-Type": MIME_TYPES[ext] || "application/octet-stream",
+    // Assets aren't fingerprinted, so always revalidate; unchanged files return a cheap 304.
+    "Cache-Control": "no-cache",
+    ETag: etag,
+    "Last-Modified": stat.mtime.toUTCString(),
+  };
+
+  const ifNoneMatch = req.headers["if-none-match"];
+  if (status === 200 && ifNoneMatch && ifNoneMatch.split(",").some((tag) => tag.trim() === etag)) {
+    res.writeHead(304, headers);
+    return res.end();
+  }
+
+  let body = await fs.promises.readFile(filePath);
+  if (COMPRESSIBLE.has(ext)) {
+    headers.Vary = "Accept-Encoding";
+    if (body.length >= MIN_GZIP_BYTES && /\bgzip\b/.test(req.headers["accept-encoding"] || "")) {
+      body = await compress(filePath, etag, body);
+      headers["Content-Encoding"] = "gzip";
+    }
+  }
+
+  headers["Content-Length"] = body.length;
+  res.writeHead(status, headers);
+  res.end(req.method === "HEAD" ? undefined : body);
+}
+
+async function serveStatic(req, res) {
   let pathname;
   try {
     pathname = decodeURIComponent(new URL(req.url, "http://localhost").pathname);
   } catch {
-    return send(res, 400, "Bad request", "text/plain");
+    return send(res, 400, "Bad request", "text/plain; charset=utf-8");
   }
+  if (pathname.includes("\0")) return send(res, 400, "Bad request", "text/plain; charset=utf-8");
   if (pathname.endsWith("/")) pathname += "index.html";
 
   const filePath = path.normalize(path.join(PUBLIC_DIR, pathname));
   if (!filePath.startsWith(PUBLIC_DIR + path.sep)) {
-    return send(res, 403, "Forbidden", "text/plain");
+    return send(res, 403, "Forbidden", "text/plain; charset=utf-8");
   }
 
-  fs.readFile(filePath, (err, data) => {
-    if (err) return send(res, 404, "Not found", "text/plain");
-    const type = MIME_TYPES[path.extname(filePath).toLowerCase()] || "application/octet-stream";
-    send(res, 200, data, type);
-  });
-}
-
-// ---------- Contact API ----------
-const hits = new Map();
-
-function isRateLimited(ip) {
-  const now = Date.now();
-  const recent = (hits.get(ip) || []).filter((t) => now - t < RATE_LIMIT.windowMs);
-  recent.push(now);
-  hits.set(ip, recent);
-  return recent.length > RATE_LIMIT.max;
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, times] of hits) {
-    if (times.every((t) => now - t >= RATE_LIMIT.windowMs)) hits.delete(ip);
-  }
-}, RATE_LIMIT.windowMs).unref();
-
-function readJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks = [];
-    req.on("data", (chunk) => {
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
-        reject(Object.assign(new Error("Payload too large"), { status: 413 }));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on("end", () => {
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-      } catch {
-        reject(Object.assign(new Error("Invalid JSON"), { status: 400 }));
-      }
-    });
-    req.on("error", reject);
-  });
-}
-
-function validate({ name, email, message }) {
-  if (typeof name !== "string" || !name.trim() || name.length > 100) return "Please enter a valid name.";
-  if (typeof email !== "string" || email.length > 150 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return "Please enter a valid email.";
-  }
-  if (typeof message !== "string" || message.trim().length < 10 || message.length > 2000) {
-    return "Message must be between 10 and 2000 characters.";
-  }
-  return null;
-}
-
-// Serialize writes so concurrent requests don't overwrite each other.
-let writeQueue = Promise.resolve();
-
-function saveMessage(entry) {
-  writeQueue = writeQueue.then(async () => {
-    let messages = [];
+  try {
+    await serveFile(req, res, filePath);
+  } catch (err) {
+    if (!["ENOENT", "EISDIR", "ENOTDIR"].includes(err.code)) console.error("Static file error:", err);
     try {
-      messages = JSON.parse(await fs.promises.readFile(MESSAGES_FILE, "utf8"));
+      await serveFile(req, res, NOT_FOUND_PAGE, 404);
     } catch {
-      // file missing or empty: start fresh
+      send(res, 404, "Not found", "text/plain; charset=utf-8");
     }
-    messages.push(entry);
-    await fs.promises.writeFile(MESSAGES_FILE, JSON.stringify(messages, null, 2));
-  });
-  return writeQueue;
-}
-
-async function handleContact(req, res) {
-  if (isRateLimited(req.socket.remoteAddress)) {
-    return send(res, 429, { error: "Too many messages. Please try again later." });
-  }
-
-  let body;
-  try {
-    body = await readJsonBody(req);
-  } catch (err) {
-    return send(res, err.status || 400, { error: err.message });
-  }
-
-  // Honeypot filled: pretend success so bots don't retry.
-  if (body.website) return send(res, 200, { ok: true });
-
-  const error = validate(body);
-  if (error) return send(res, 400, { error });
-
-  try {
-    await saveMessage({
-      name: body.name.trim(),
-      email: body.email.trim(),
-      message: body.message.trim(),
-      receivedAt: new Date().toISOString(),
-    });
-    console.log(`New message from ${body.name.trim()} <${body.email.trim()}>`);
-    send(res, 200, { ok: true });
-  } catch (err) {
-    console.error("Failed to save message:", err);
-    send(res, 500, { error: "Could not save your message. Please try again later." });
   }
 }
 
 // ---------- Server ----------
-const server = http.createServer((req, res) => {
-  if (req.url === "/api/contact") {
-    if (req.method !== "POST") return send(res, 405, { error: "Method not allowed" });
-    return handleContact(req, res);
-  }
-  if (req.method !== "GET" && req.method !== "HEAD") {
-    return send(res, 405, "Method not allowed", "text/plain");
-  }
-  serveStatic(req, res);
-});
+function createServer() {
+  return http.createServer((req, res) => {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      return send(res, 405, "Method not allowed", "text/plain; charset=utf-8");
+    }
+    serveStatic(req, res);
+  });
+}
 
-server.listen(PORT, () => {
-  console.log(`Portfolio running at http://localhost:${PORT}`);
-});
+module.exports = { createServer };
+
+if (require.main === module) {
+  createServer().listen(PORT, () => {
+    console.log(`Portfolio running at http://localhost:${PORT}`);
+  });
+}
